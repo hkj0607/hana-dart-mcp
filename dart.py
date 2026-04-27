@@ -1526,6 +1526,237 @@ async def search_json_financial_data(
     return result.strip()
 
 
+# ────────────────────────────────────────────────────────────
+# 감사보고서 손익계산서 파서 헬퍼
+# 두 가지 XML 구조 지원:
+#   (A) TE + ADELIM (XBRL 태깅) 스타일  — 예: 위킵, 하이리움산업
+#   (B) HTML TABLE/TR/TD 스타일          — 예: 트랜드아이, 현대로보틱스
+# ────────────────────────────────────────────────────────────
+
+_AUDIT_LABEL_MAP = {
+    "매출": "매출액", "매출액": "매출액", "수익": "매출액",
+    "영업수익": "매출액",
+    "매출원가": "매출원가",
+    "매출총이익": "매출총이익", "매출총손실": "매출총이익",
+    "판매비와관리비": "판매비와관리비", "판매비와일반관리비": "판매비와관리비",
+    "영업이익": "영업이익", "영업손실": "영업이익",
+    "영업이익손실": "영업이익", "영업손익": "영업이익",
+    "법인세비용차감전순이익": "법인세비용차감전순이익",
+    "법인세비용차감전순손실": "법인세비용차감전순이익",
+    "법인세비용차감전순이익손실": "법인세비용차감전순이익",
+    "법인세비용차감전이익": "법인세비용차감전순이익",
+    "법인세비용차감전손실": "법인세비용차감전순이익",
+    "법인세차감전순이익": "법인세비용차감전순이익",
+    "법인세비용": "법인세비용", "법인세수익": "법인세비용",
+    "당기순이익": "당기순이익", "당기순손실": "당기순이익",
+    "당기순이익손실": "당기순이익", "당기순손익": "당기순이익",
+    "분기순이익": "당기순이익", "반기순이익": "당기순이익",
+}
+_AUDIT_CORE = {"매출액", "영업이익", "당기순이익"}
+_AUDIT_DISPLAY_ORDER = [
+    "매출액", "매출원가", "매출총이익", "판매비와관리비",
+    "영업이익", "법인세비용차감전순이익", "법인세비용", "당기순이익",
+]
+_AUDIT_LOSS_TARGETS = {"영업이익", "당기순이익", "법인세비용차감전순이익", "매출총이익"}
+
+
+def _audit_strip_tags(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s)
+
+
+def _audit_normalize_label(label: str) -> str:
+    """로마/아라비아 숫자 접두사, 주석 참조, 괄호, 공백 제거한 정규 키"""
+    label = _audit_strip_tags(label)
+    label = re.sub(r"^[IVXilvxⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ\d]+[\.\s]*", "", label)
+    label = re.sub(r"\(\s*주[석\s]*\d+[\d,\s]*\)", "", label)
+    label = label.replace("(", "").replace(")", "")
+    label = re.sub(r"\s+", "", label)
+    return label.strip()
+
+
+def _audit_resolve_target(label_norm: str) -> Optional[str]:
+    """정규화 라벨 → 표준 계정명. 정확매칭 → 포함매칭 순."""
+    if not label_norm:
+        return None
+    if label_norm in _AUDIT_LABEL_MAP:
+        return _AUDIT_LABEL_MAP[label_norm]
+    if "매출총손실" in label_norm or "매출총이익" in label_norm:
+        return "매출총이익"
+    if "법인세비용차감전" in label_norm or "법인세차감전" in label_norm:
+        return "법인세비용차감전순이익"
+    if "당기순손실" in label_norm or "당기순이익" in label_norm or "당기순손익" in label_norm:
+        return "당기순이익"
+    if "영업손실" in label_norm or "영업이익" in label_norm or "영업손익" in label_norm:
+        return "영업이익"
+    if "판매비와관리비" in label_norm or "판매비와일반관리비" in label_norm:
+        return "판매비와관리비"
+    if "매출원가" in label_norm:
+        return "매출원가"
+    if label_norm == "매출" or label_norm.startswith("매출액") or label_norm.startswith("영업수익"):
+        return "매출액"
+    return None
+
+
+def _audit_is_amount(s: str) -> bool:
+    """천단위 쉼표 포맷의 숫자만 금액으로 인정 (주석번호 오픽업 방지)"""
+    s = _audit_strip_tags(s).strip()
+    if not s or s == "-":
+        return False
+    inner = s
+    if inner.startswith("(") and inner.endswith(")"):
+        inner = inner[1:-1].strip()
+    if inner.startswith("-") or inner.startswith("△") or inner.startswith("▲"):
+        inner = inner[1:].strip()
+    if re.fullmatch(r"\d{1,3}(,\d{3})+", inner):
+        return True
+    if re.fullmatch(r"\d{4,}", inner):
+        return True
+    return False
+
+
+def _audit_apply_loss(val: str) -> str:
+    """손실 값에 괄호 표기 부여 (이미 음수/괄호 표기면 건드리지 않음)"""
+    if val == "-" or not val:
+        return val
+    if val.startswith("(") or val.startswith("-") or val.startswith("△") or val.startswith("▲"):
+        return val
+    return f"({val})"
+
+
+def _audit_find_is_section(xml: str) -> str:
+    """손익계산서 섹션 범위 반환. TITLE 탐지 실패 시 전체 반환."""
+    for pat in (
+        r"<TITLE[^>]*>\s*포\s*괄\s*손\s*익\s*계\s*산\s*서\s*</TITLE>",
+        r"<TITLE[^>]*>\s*손\s*익\s*계\s*산\s*서\s*</TITLE>",
+    ):
+        m = re.search(pat, xml)
+        if m:
+            nxt = re.search(r"<TITLE[^>]*>", xml[m.end():])
+            end = m.end() + (nxt.start() if nxt else 40000)
+            return xml[m.end():end]
+    # fallback: "(첨부)재 무 제 표" 구간
+    m = re.search(r"<TITLE[^>]*>[^<]*첨부[^<]*재\s*무\s*제\s*표[^<]*</TITLE>", xml)
+    if m:
+        nxt = re.search(r"<TITLE[^>]*>\s*주\s*석\s*</TITLE>", xml[m.end():])
+        end = m.end() + (nxt.start() if nxt else len(xml))
+        return xml[m.end():end]
+    return xml
+
+
+def _audit_parse_te_adelim(section: str) -> Optional[Dict[str, Tuple[str, str]]]:
+    """TE+ADELIM 구조 파싱. ACODE별로 ADELIM 인덱스를 모으고 라벨 기반 매칭."""
+    acode_data: Dict[str, Dict[int, str]] = {}
+    for m in re.finditer(r"<TE([^>]*)>(.*?)</TE>", section, re.DOTALL):
+        attrs, text = m.group(1), _audit_strip_tags(m.group(2)).strip()
+        acode_m = re.search(r'ACODE="([^"]*)"', attrs)
+        adelim_m = re.search(r'ADELIM="(\d+)"', attrs)
+        if not acode_m or not adelim_m:
+            continue
+        acode = acode_m.group(1)
+        adelim = int(adelim_m.group(1))
+        if acode not in acode_data:
+            acode_data[acode] = {}
+        if adelim not in acode_data[acode] or not acode_data[acode][adelim]:
+            acode_data[acode][adelim] = text
+
+    if not acode_data:
+        return None
+
+    result: Dict[str, Tuple[str, str]] = {}
+    for acode, data in acode_data.items():
+        label = data.get(0, "")
+        if not label:
+            continue
+        target = _audit_resolve_target(_audit_normalize_label(label))
+        if not target:
+            continue
+        amounts = []
+        for adelim in sorted(data.keys()):
+            if adelim == 0:
+                continue
+            v = data[adelim]
+            if v and _audit_is_amount(v):
+                amounts.append(v)
+        if not amounts:
+            continue
+        current = amounts[0]
+        prior = amounts[1] if len(amounts) > 1 else "-"
+        if "손실" in label and target in _AUDIT_LOSS_TARGETS:
+            current = _audit_apply_loss(current)
+            prior = _audit_apply_loss(prior)
+        if target not in result:
+            result[target] = (current, prior)
+    return result if result else None
+
+
+def _audit_parse_html_tables(section: str) -> Optional[Dict[str, Tuple[str, str]]]:
+    """HTML TABLE/TR/TD 파싱. 가장 많은 목표 계정을 담은 테이블 선택."""
+    tables = re.findall(r"<TABLE[^>]*>(.*?)</TABLE>", section, re.DOTALL)
+    best: Optional[Dict[str, Tuple[str, str]]] = None
+    best_score = 0
+    for table in tables:
+        rows = re.findall(r"<TR[^>]*>(.*?)</TR>", table, re.DOTALL)
+        if len(rows) < 3:
+            continue
+        result: Dict[str, Tuple[str, str]] = {}
+        for row in rows:
+            tds = re.findall(r"<TD[^>]*>(.*?)</TD>", row, re.DOTALL)
+            text_tds = [_audit_strip_tags(t).strip() for t in tds]
+            if len(text_tds) < 2:
+                continue
+            label_raw = text_tds[0]
+            if not label_raw and len(text_tds) >= 3:
+                label_raw = text_tds[1]
+                text_tds = text_tds[1:]
+            target = _audit_resolve_target(_audit_normalize_label(label_raw))
+            if not target:
+                continue
+            nums = [t for t in text_tds[1:] if _audit_is_amount(t)]
+            if not nums:
+                continue
+            current = nums[0]
+            prior = nums[1] if len(nums) > 1 else "-"
+            if "손실" in _audit_strip_tags(label_raw) and target in _AUDIT_LOSS_TARGETS:
+                current = _audit_apply_loss(current)
+                prior = _audit_apply_loss(prior)
+            if target not in result:
+                result[target] = (current, prior)
+        score = len(result) + (10 if _AUDIT_CORE.issubset(result) else 0)
+        if score > best_score:
+            best_score = score
+            best = result
+    return best
+
+
+def _audit_parse_is(xml: str) -> Optional[Dict[str, Tuple[str, str]]]:
+    """두 파싱 방식을 모두 시도하고 더 나은 결과 채택."""
+    section = _audit_find_is_section(xml)
+    a = _audit_parse_te_adelim(section)
+    b = _audit_parse_html_tables(section)
+    candidates = []
+    for r in (a, b):
+        if not r:
+            continue
+        score = len(r) + (10 if _AUDIT_CORE.issubset(r) else 0)
+        candidates.append((score, r))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def _audit_detect_unit(xml: str, section: str) -> str:
+    """금액 단위 탐지. TU 태그 → 섹션 내 "(단위: ...)" 텍스트 → 기본값 '원'."""
+    m = re.search(r'<TU[^>]*AUNIT="WON"[^>]*AUNITVALUE="(\d+)"', xml)
+    if m:
+        val = int(m.group(1))
+        return {1: "원", 1000: "천원", 1000000: "백만원"}.get(val, f"원({val}배)")
+    m = re.search(r"\(\s*단위\s*[:\s]*([^)<>]{1,10})\s*\)", section)
+    if m:
+        return m.group(1).strip()
+    return "원"
+
+
 @mcp.tool()
 async def search_audit_report_financial(
     company_name: str,
@@ -1536,7 +1767,9 @@ async def search_audit_report_financial(
 ) -> str:
     """
     비상장 외감기업 등 감사보고서 기반의 재무데이터를 조회하는 도구.
-    사업보고서가 없는 비상장기업의 감사보고서/연결감사보고서에서 재무데이터를 추출합니다.
+    사업보고서가 없는 비상장기업의 감사보고서/연결감사보고서에서 손익계산서 주요 항목
+    (매출액, 매출원가, 매출총이익, 판매비와관리비, 영업이익, 법인세비용차감전순이익,
+    법인세비용, 당기순이익)을 추출합니다.
 
     Args:
         company_name: 회사명 (예: 위킵, 하이리움산업 등)
@@ -1546,7 +1779,7 @@ async def search_audit_report_financial(
         report_type: 보고서 유형 필터 ("감사보고서", "연결감사보고서", None=전체)
 
     Returns:
-        감사보고서에서 추출한 손익계산서 주요 항목 (매출액, 영업이익, 당기순이익 등)
+        감사보고서에서 추출한 손익계산서 주요 항목의 마크다운 표.
     """
     try:
         corp_code, matched_name = await get_corp_code_by_name(company_name)
@@ -1555,7 +1788,6 @@ async def search_audit_report_financial(
 
         ctx.info(f"{matched_name}(고유번호: {corp_code})의 감사보고서를 검색합니다.")
 
-        # 공시목록 조회 (전체 - pblntf_ty 없이)
         url = f"{BASE_URL}/list.json?crtfc_key={API_KEY}&corp_code={corp_code}&bgn_de={start_date}&end_de={end_date}&page_count=100"
 
         async with httpx.AsyncClient(timeout=30) as client:
@@ -1565,7 +1797,6 @@ async def search_audit_report_financial(
             if data.get("status") != "000":
                 return f"공시 목록이 없습니다. (회사: {matched_name})"
 
-            # 감사보고서/연결감사보고서 필터
             audit_reports = []
             for item in data.get("list", []):
                 rpt_nm = item.get("report_nm", "")
@@ -1582,30 +1813,6 @@ async def search_audit_report_financial(
 
             result = f"# {matched_name} 감사보고서 재무데이터\n\n"
 
-            # Taxonomy 기반 ACODE 매핑 사용
-            target_acodes = {}  # acode -> {account, sign}
-            if ACODE_MAP:
-                target_acodes = {k: v for k, v in ACODE_MAP.items()}
-            else:
-                # fallback: 하드코딩
-                for acode, info in {
-                    "12100000010000": {"account": "매출액", "sign": "positive"},
-                    "12200000010000": {"account": "매출원가", "sign": "positive"},
-                    "12300000010000": {"account": "매출총이익", "sign": "positive"},
-                    "12500000010000": {"account": "영업이익", "sign": "positive"},
-                    "12500000020000": {"account": "영업이익", "sign": "negative"},
-                    "12700000010000": {"account": "법인세비용차감전순이익", "sign": "positive"},
-                    "12700000020000": {"account": "법인세비용차감전순이익", "sign": "negative"},
-                    "12900000010000": {"account": "당기순이익", "sign": "positive"},
-                    "12900000020000": {"account": "당기순이익", "sign": "negative"},
-                }.items():
-                    target_acodes[acode] = info
-
-            # 표시할 계정 순서
-            display_order = ["매출액", "매출원가", "매출총이익", "판매비와관리비",
-                           "영업이익", "영업외수익", "영업외비용",
-                           "법인세비용차감전순이익", "법인세비용", "당기순이익"]
-
             for report in audit_reports:
                 rcept_no = report["rcept_no"]
                 rcept_dt = report["rcept_dt"]
@@ -1616,87 +1823,45 @@ async def search_audit_report_financial(
                 try:
                     doc_resp = await client.get(
                         f"{BASE_URL}/document.xml",
-                        params={"crtfc_key": API_KEY, "rcept_no": rcept_no}
+                        params={"crtfc_key": API_KEY, "rcept_no": rcept_no},
                     )
 
                     xml_content = None
                     with zipfile.ZipFile(BytesIO(doc_resp.content)) as zf:
                         for name in zf.namelist():
-                            if name.endswith('.xml'):
-                                xml_content = zf.read(name).decode('utf-8', errors='replace')
+                            if name.endswith(".xml"):
+                                raw = zf.read(name)
+                                for enc in ("utf-8", "euc-kr", "cp949"):
+                                    try:
+                                        xml_content = raw.decode(enc)
+                                        break
+                                    except UnicodeDecodeError:
+                                        continue
+                                if xml_content is None:
+                                    xml_content = raw.decode("utf-8", errors="replace")
                                 break
 
                     if not xml_content:
                         result += "XML 문서를 찾을 수 없습니다.\n\n"
                         continue
 
-                    te_pattern = re.compile(r'<TE[^>]*ACODE="([^"]*)"[^>]*ADELIM="(\d+)"[^>]*>([^<]*)</TE>')
-                    matches = te_pattern.findall(xml_content)
+                    parsed = _audit_parse_is(xml_content)
+                    if not parsed:
+                        result += "손익계산서를 파싱할 수 없습니다 (구조 미지원).\n\n"
+                        continue
 
-                    acode_data = {}
-                    for acode, adelim, text in matches:
-                        if acode not in acode_data:
-                            acode_data[acode] = {}
-                        adelim_int = int(adelim)
-                        if adelim_int not in acode_data[acode] or not acode_data[acode][adelim_int]:
-                            acode_data[acode][adelim_int] = text.strip()
-
-                    # 당기/전기 열 판별
-                    def find_amount_columns(acode_data_dict):
-                        amount_adelims = set()
-                        for acode in target_acodes:
-                            if acode in acode_data_dict:
-                                for adelim, val in acode_data_dict[acode].items():
-                                    if adelim > 0 and val and val != '-':
-                                        clean = val.replace(",","").replace("(","").replace(")","").replace("-","").replace(" ","")
-                                        if clean.isdigit():
-                                            amount_adelims.add(adelim)
-                        amount_adelims = sorted(amount_adelims)
-                        current = amount_adelims[0] if len(amount_adelims) > 0 else 2
-                        prior = amount_adelims[1] if len(amount_adelims) > 1 else 4
-                        return current, prior
-
-                    current_col, prior_col = find_amount_columns(acode_data)
-
-                    def parse_amount_str(val):
-                        if not val or val == '-':
-                            return '-'
-                        return val
-
-                    # 계정별 데이터 수집 (동일 계정 중복 ACODE 통합)
-                    account_results = {}
-                    for acode, info in target_acodes.items():
-                        if acode not in acode_data:
-                            continue
-                        acct_name = info["account"]
-                        sign = info["sign"]
-                        label = acode_data[acode].get(0, acct_name)
-                        clean_label = re.sub(r'^[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+[\.\s]*', '', label).strip()
-                        cur = parse_amount_str(acode_data[acode].get(current_col, ""))
-                        pri = parse_amount_str(acode_data[acode].get(prior_col, ""))
-
-                        if cur != '-' or pri != '-':
-                            # 손실 계정 표시
-                            if sign == "negative":
-                                if cur != '-' and not cur.startswith("(") and not cur.startswith("-"):
-                                    cur = f"({cur})"
-                                if pri != '-' and not pri.startswith("(") and not pri.startswith("-"):
-                                    pri = f"({pri})"
-
-                            if acct_name not in account_results:
-                                account_results[acct_name] = (clean_label, cur, pri)
+                    section = _audit_find_is_section(xml_content)
+                    unit = _audit_detect_unit(xml_content, section)
 
                     result += "| 항목 | 당기 | 전기 |\n"
                     result += "|------|------|------|\n"
-
-                    for acct in display_order:
-                        if acct in account_results:
-                            label, cur, pri = account_results[acct]
-                            result += f"| {label} | {cur} | {pri} |\n"
-
+                    for acct in _AUDIT_DISPLAY_ORDER:
+                        if acct in parsed:
+                            cur, pri = parsed[acct]
+                            result += f"| {acct} | {cur} | {pri} |\n"
                     result += "\n"
-                    result += f"- 금액 단위: 원\n"
-                    result += f"- 데이터 출처: DART 감사보고서 XBRL\n\n"
+                    result += f"- 금액 단위: {unit}\n"
+                    result += "- 데이터 출처: DART 감사보고서\n\n"
 
                 except Exception as e:
                     result += f"문서 파싱 오류: {str(e)}\n\n"
